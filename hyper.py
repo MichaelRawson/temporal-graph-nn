@@ -1,0 +1,4 @@
+LAYERS = 4
+HIDDEN = 128
+
+BATCH = 64
