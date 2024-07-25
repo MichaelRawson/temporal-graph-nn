@@ -2,7 +2,7 @@ import torch
 from torch import Tensor
 from torch.nn import Module, ModuleList, Linear
 
-from hyper import LAYERS, HIDDEN
+from hyper import LAYERS, HIDDEN, DEVICE
 
 class LinkPrediction(Module):
     """link prediction head"""
@@ -18,7 +18,7 @@ class LinkPrediction(Module):
         self.output = Linear(HIDDEN, 1)
 
     def forward(self, h_u: Tensor, h_v: Tensor) -> Tensor:
-        h = torch.cat((h_u, h_v))
+        h = torch.cat((h_u, h_v), 1)
         return self.output(torch.relu(self.hidden(h)))
 
 
@@ -59,8 +59,8 @@ class T1Layer(Module):
         # move dimensions around a bit, should be cheap
         u = u.unsqueeze(1).expand(-1, self.agg_features)
         v = v.unsqueeze(1).expand(-1, self.agg_features)
-        save_u = self.save_u[:event + 1]
-        save_v = self.save_v[:event + 1]
+        save_u = self.save_u[:event]
+        save_v = self.save_v[:event]
 
         # aggregate into v
         src_u = torch.cat((
@@ -101,25 +101,38 @@ class T1(Module):
         self.layers = ModuleList(layers)
         self.link = LinkPrediction(embed_size)
 
-    def embed(self, u: Tensor, v: Tensor, t: Tensor, event: int) -> Tensor:
+    def embed(self, u: Tensor, v: Tensor, t: Tensor, event: int) -> list[Tensor]:
         """compute the embedding for each node at the present time"""
 
-        u = u[:event + 1]
-        v = v[:event + 1]
-        t = t[:event + 1]
-        g = ((t[-1] - t) / (1 + t[-1] - t[0])).unsqueeze(1)
-        # no node-level embedding
-        h = torch.zeros(self.total_nodes, 0, device=u.device)
+        u = u[:event]
+        v = v[:event]
+        t = t[:event]
+        # special-case for the first event
+        if event == 0:
+            tfirst = 0
+            tlast = 0
+        else:
+            tfirst = t[0]
+            tlast = t[-1]
 
+        g = ((tlast - t) / (1 + tlast - tfirst)).unsqueeze(1)
+        # no node-level embedding
+        h = torch.zeros(self.total_nodes, 0, device=DEVICE)
+
+        hs = [h]
         for layer in self.layers:
+            h = layer(u, v, g, h, event)
+            hs.append(h)
+        return hs
+
+    def save(self, hs: list[Tensor], u: Tensor, v: Tensor, event: int):
+        for h, layer in zip(hs, self.layers):
             # NB detach()!!
             layer.save(
-                h[u[-1]].detach(),
-                h[v[-1]].detach(),
+                h[u].detach(),
+                h[v].detach(),
                 event
             )
-            h = layer(u, v, g, h, event)
-        return h
 
     def predict_link(self, h: Tensor, u: Tensor, v: Tensor) -> Tensor:
         """given an embedding, predict whether {u, v} at the next time point"""
