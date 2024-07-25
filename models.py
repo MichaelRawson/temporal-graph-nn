@@ -1,7 +1,6 @@
 import torch
 from torch import Tensor
 from torch.nn import Module, ModuleList, Linear
-import torch.nn.functional as F
 
 from hyper import LAYERS, HIDDEN
 
@@ -20,19 +19,20 @@ class LinkPrediction(Module):
 
     def forward(self, h_u: Tensor, h_v: Tensor) -> Tensor:
         h = torch.cat((h_u, h_v))
-        return self.output(F.relu(self.hidden(h)))
+        return self.output(torch.relu(self.hidden(h)))
+
 
 class T1Layer(Module):
     """a single layer in a T1 model"""
 
+    agg_features: int
+    """number of features after aggregation"""
     save_u: Tensor
     """(stale, non-differentiable) h_v(t') at previous layer if {u, v} is an edge in the temporal graph at t'"""
     save_u: Tensor
     """(stale, non-differentiable) h_u(t') at previous layer if {u, v} is an edge in the temporal graph at t'"""
-    agg: Tensor
-    """temporary buffer for aggregation results"""
-    src: Tensor
-    """temporary buffer for scatter source"""
+    zeros: Tensor
+    """appropriately-sized zero buffer for scatter ops"""
     w1: Linear
     """first linear transform"""
     w2: Linear
@@ -42,11 +42,10 @@ class T1Layer(Module):
         super().__init__()
         self.register_buffer('save_u', torch.zeros(total_events, previous_embed_size), persistent=False)
         self.register_buffer('save_v', torch.zeros(total_events, previous_embed_size), persistent=False)
-        agg_size = previous_embed_size + 1
-        self.register_buffer('agg', torch.zeros(total_nodes, agg_size), persistent=False)
-        self.register_buffer('src', torch.zeros(total_events, previous_embed_size + 1), persistent=False)
-        self.w1 = Linear(agg_size, agg_size)
-        out_size = agg_size + previous_embed_size
+        self.agg_features = previous_embed_size + 1
+        self.register_buffer('zeros', torch.zeros(total_nodes, self.agg_features), persistent=False)
+        self.w1 = Linear(self.agg_features, self.agg_features)
+        out_size = self.agg_features + previous_embed_size
         self.w2 = Linear(out_size, out_size)
 
     def save(self, h_u: Tensor, h_v: Tensor, event: int):
@@ -58,26 +57,28 @@ class T1Layer(Module):
         """forwards pass"""
 
         # move dimensions around a bit, should be cheap
-        u = u.unsqueeze(1).expand(-1, self.agg.shape[1])
-        v = v.unsqueeze(1).expand(-1, self.agg.shape[1])
+        u = u.unsqueeze(1).expand(-1, self.agg_features)
+        v = v.unsqueeze(1).expand(-1, self.agg_features)
         save_u = self.save_u[:event + 1]
         save_v = self.save_v[:event + 1]
 
-        # zero aggregation
-        self.agg.zero_()
-        # only care about the valid entries of `self.src`
-        src = self.src[:event + 1]
-
         # aggregate into v
-        src[:,:-1] = save_u
-        src[:, -1] = g
-        self.agg.scatter_add_(0, v, src)
-        # aggregate into u
-        src[:event + 1,:-1] = save_v
-        src[:event + 1, -1] = g
-        self.agg.scatter_add_(0, u, src)
+        src_u = torch.cat((
+            save_u,
+            g
+        ), 1)
+        agg_v = torch.scatter_add(self.zeros, 0, v, src_u)
 
-        return self.w2(torch.cat((h, F.relu(self.w1(self.agg))), 1))
+        # aggregate into u
+        src_v = torch.cat((
+            save_v,
+            g
+        ), 1)
+        agg_u = torch.scatter_add(self.zeros, 0, u, src_v)
+
+        agg = agg_u + agg_v
+        return self.w2(torch.cat((h, torch.relu(self.w1(agg))), 1))
+
 
 class T1(Module):
     """a T1 model"""
@@ -87,11 +88,11 @@ class T1(Module):
     layers: ModuleList
     """the embedding layers for this model"""
     link: LinkPrediction
+    """output layer"""
 
     def __init__(self, total_nodes: int, total_events: int):
         super().__init__()
         self.total_nodes = total_nodes
-
         layers = []
         embed_size = 0
         for _ in range(LAYERS):
@@ -106,7 +107,7 @@ class T1(Module):
         u = u[:event + 1]
         v = v[:event + 1]
         t = t[:event + 1]
-        g = (t[-1] - t) / (1 + t[-1] - t[0])
+        g = ((t[-1] - t) / (1 + t[-1] - t[0])).unsqueeze(1)
         # no node-level embedding
         h = torch.zeros(self.total_nodes, 0, device=u.device)
 
