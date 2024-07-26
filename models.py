@@ -23,19 +23,15 @@ class LinkPrediction(Module):
         return self.output(torch.relu(self.hidden(h)))
 
 
-class T1Layer(Module):
-    """a single layer in a T1 model"""
+class T12(Module):
+    """base class for T1 and T2"""
 
     agg_features: int
     """number of features after aggregation"""
-    remember_u: Tensor
-    """(stale, non-differentiable) h_v(t') at previous layer if {u, v} is an edge in the temporal graph at t'"""
-    remember_u: Tensor
-    """(stale, non-differentiable) h_u(t') at previous layer if {u, v} is an edge in the temporal graph at t'"""
-    zeros: Tensor
-    """appropriately-sized zero buffer for scatter ops"""
     bn: BatchNorm1d
     """batch normalisation"""
+    zeros: Tensor
+    """appropriately-sized zero buffer for scatter ops"""
     w1: Linear
     """first linear transform"""
     w2: Linear
@@ -43,8 +39,7 @@ class T1Layer(Module):
 
     def __init__(self, total_nodes: int, total_events: int, previous_embed_size: int):
         super().__init__()
-        self.register_buffer('remember_u', torch.zeros(total_events, previous_embed_size), persistent=False)
-        self.register_buffer('remember_v', torch.zeros(total_events, previous_embed_size), persistent=False)
+        _ = total_events
         self.agg_features = previous_embed_size + 1
         self.register_buffer('zeros', torch.zeros(total_nodes, self.agg_features), persistent=False)
         self.bn = BatchNorm1d(self.agg_features)
@@ -52,14 +47,29 @@ class T1Layer(Module):
         out_size = self.agg_features + previous_embed_size
         self.w2 = Linear(out_size, out_size)
 
+    def after_aggregation(self, h: Tensor, agg: Tensor) -> Tensor:
+        return self.w2(torch.cat((h, torch.relu(self.w1(self.bn(agg)))), 1))
+
+
+class T1(T12):
+    """a single layer in a T1 model"""
+
+    remember_u: Tensor
+    """(stale, non-differentiable) h_v(t') at previous layer if {u, v} is an edge in the temporal graph at t'"""
+    remember_u: Tensor
+    """(stale, non-differentiable) h_u(t') at previous layer if {u, v} is an edge in the temporal graph at t'"""
+
+    def __init__(self, total_nodes: int, total_events: int, previous_embed_size: int):
+        super().__init__(total_nodes, total_events, previous_embed_size)
+        self.register_buffer('remember_u', torch.zeros(total_events, previous_embed_size), persistent=False)
+        self.register_buffer('remember_v', torch.zeros(total_events, previous_embed_size), persistent=False)
+
     def remember(self, h_u: Tensor, h_v: Tensor, event: int):
         """remember h_v(t) and h_u(t) for future reference"""
         self.remember_u[event] = h_u
         self.remember_v[event] = h_v
 
     def forward(self, u: Tensor, v: Tensor, g: Tensor, h: Tensor, event: int) -> Tensor:
-        """forwards pass"""
-
         # move dimensions around a bit, should be cheap
         u = u.unsqueeze(1).expand(-1, self.agg_features)
         v = v.unsqueeze(1).expand(-1, self.agg_features)
@@ -81,11 +91,37 @@ class T1Layer(Module):
         agg_u = torch.scatter_add(self.zeros, 0, u, src_v)
 
         agg = agg_u + agg_v
-        return self.w2(torch.cat((h, torch.relu(self.w1(self.bn(agg)))), 1))
+        return self.after_aggregation(h, agg)
 
 
-class T1(Module):
-    """a T1 model"""
+class T2(T12):
+    """a single layer in a T2 model"""
+
+    def remember(self, *_):
+        """don't need to remember anything"""
+        pass
+
+    def forward(self, u: Tensor, v: Tensor, g: Tensor, h: Tensor, _: int) -> Tensor:
+        src_u = torch.cat((
+            h[u],
+            g
+        ), 1)
+        src_v = torch.cat((
+            h[v],
+            g
+        ), 1)
+
+        u = u.unsqueeze(1).expand(-1, self.agg_features)
+        v = v.unsqueeze(1).expand(-1, self.agg_features)
+        agg_u = torch.scatter_add(self.zeros, 0, u, src_v)
+        agg_v = torch.scatter_add(self.zeros, 0, v, src_u)
+
+        agg = agg_u + agg_v
+        return self.after_aggregation(h, agg)
+
+
+class Model(Module):
+    """a T1/T2 model"""
 
     total_nodes: int
     """total nodes in the graph"""
@@ -94,13 +130,14 @@ class T1(Module):
     link: LinkPrediction
     """output layer"""
 
-    def __init__(self, total_nodes: int, total_events: int):
+    def __init__(self, flavour: str, total_nodes: int, total_events: int):
         super().__init__()
         self.total_nodes = total_nodes
+        Layer = {'T1': T1, 'T2': T2}[flavour]
         layers = []
         embed_size = 0
         for _ in range(LAYERS):
-            layers.append(T1Layer(total_nodes, total_events, embed_size))
+            layers.append(Layer(total_nodes, total_events, embed_size))
             embed_size = 2 * embed_size + 1
         self.layers = ModuleList(layers)
         self.link = LinkPrediction(embed_size)

@@ -4,16 +4,19 @@ from torch.utils.tensorboard import SummaryWriter
 from tgb.linkproppred.dataset_pyg import PyGLinkPropPredDataset
 from tgb.linkproppred.evaluate import Evaluator
 
-from models import T1
+from models import Model
 from hyper import BATCH, DEVICE, TOLERANCE, make_optimiser
 
 if __name__ == '__main__':
+    import sys
+    _, flavour, data_name = sys.argv
+
     torch.manual_seed(0)
 
-    dataset = PyGLinkPropPredDataset(name="tgbl-wiki", root="datasets")
+    dataset = PyGLinkPropPredDataset(name=data_name, root="datasets")
     dataset.load_val_ns()
     dataset.load_test_ns()
-    evaluator = Evaluator(name="tgbl-wiki")
+    evaluator = Evaluator(name=data_name)
     total_nodes = max(int(dataset.src.max()), int(dataset.dst.max().item())) + 1
     total_events = len(dataset.ts)
     num_train = int(dataset.train_mask.sum())
@@ -26,7 +29,7 @@ if __name__ == '__main__':
     dst = dataset.dst.to(DEVICE)
     ts = dataset.ts.to(DEVICE)
 
-    model = T1(total_nodes, total_events).to(DEVICE)
+    model = Model(flavour, total_nodes, total_events).to(DEVICE)
     optimiser = make_optimiser(model)
     writer = SummaryWriter()
     total_examples = 0
