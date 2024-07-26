@@ -1,6 +1,7 @@
 import torch
 from torch import Tensor
-from torch.nn import Module, ModuleList, Linear
+from torch.nn import BatchNorm1d, Module, ModuleList, Linear
+from torch.nn.modules import BatchNorm1d
 
 from hyper import LAYERS, HIDDEN, DEVICE
 
@@ -27,12 +28,14 @@ class T1Layer(Module):
 
     agg_features: int
     """number of features after aggregation"""
-    save_u: Tensor
+    remember_u: Tensor
     """(stale, non-differentiable) h_v(t') at previous layer if {u, v} is an edge in the temporal graph at t'"""
-    save_u: Tensor
+    remember_u: Tensor
     """(stale, non-differentiable) h_u(t') at previous layer if {u, v} is an edge in the temporal graph at t'"""
     zeros: Tensor
     """appropriately-sized zero buffer for scatter ops"""
+    bn: BatchNorm1d
+    """batch normalisation"""
     w1: Linear
     """first linear transform"""
     w2: Linear
@@ -40,18 +43,19 @@ class T1Layer(Module):
 
     def __init__(self, total_nodes: int, total_events: int, previous_embed_size: int):
         super().__init__()
-        self.register_buffer('save_u', torch.zeros(total_events, previous_embed_size), persistent=False)
-        self.register_buffer('save_v', torch.zeros(total_events, previous_embed_size), persistent=False)
+        self.register_buffer('remember_u', torch.zeros(total_events, previous_embed_size), persistent=False)
+        self.register_buffer('remember_v', torch.zeros(total_events, previous_embed_size), persistent=False)
         self.agg_features = previous_embed_size + 1
         self.register_buffer('zeros', torch.zeros(total_nodes, self.agg_features), persistent=False)
+        self.bn = BatchNorm1d(self.agg_features)
         self.w1 = Linear(self.agg_features, self.agg_features)
         out_size = self.agg_features + previous_embed_size
         self.w2 = Linear(out_size, out_size)
 
-    def save(self, h_u: Tensor, h_v: Tensor, event: int):
+    def remember(self, h_u: Tensor, h_v: Tensor, event: int):
         """remember h_v(t) and h_u(t) for future reference"""
-        self.save_u[event] = h_u
-        self.save_v[event] = h_v
+        self.remember_u[event] = h_u
+        self.remember_v[event] = h_v
 
     def forward(self, u: Tensor, v: Tensor, g: Tensor, h: Tensor, event: int) -> Tensor:
         """forwards pass"""
@@ -59,25 +63,25 @@ class T1Layer(Module):
         # move dimensions around a bit, should be cheap
         u = u.unsqueeze(1).expand(-1, self.agg_features)
         v = v.unsqueeze(1).expand(-1, self.agg_features)
-        save_u = self.save_u[:event]
-        save_v = self.save_v[:event]
+        remember_u = self.remember_u[:event]
+        remember_v = self.remember_v[:event]
 
         # aggregate into v
         src_u = torch.cat((
-            save_u,
+            remember_u,
             g
         ), 1)
         agg_v = torch.scatter_add(self.zeros, 0, v, src_u)
 
         # aggregate into u
         src_v = torch.cat((
-            save_v,
+            remember_v,
             g
         ), 1)
         agg_u = torch.scatter_add(self.zeros, 0, u, src_v)
 
         agg = agg_u + agg_v
-        return self.w2(torch.cat((h, torch.relu(self.w1(agg))), 1))
+        return self.w2(torch.cat((h, torch.relu(self.w1(self.bn(agg)))), 1))
 
 
 class T1(Module):
@@ -125,10 +129,11 @@ class T1(Module):
             hs.append(h)
         return hs
 
-    def save(self, hs: list[Tensor], u: Tensor, v: Tensor, event: int):
+    def remember(self, hs: list[Tensor], u: Tensor, v: Tensor, event: int):
+        """remember this embedding for future reference"""
         for h, layer in zip(hs, self.layers):
             # NB detach()!!
-            layer.save(
+            layer.remember(
                 h[u].detach(),
                 h[v].detach(),
                 event

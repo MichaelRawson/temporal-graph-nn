@@ -3,7 +3,7 @@ from torch.nn import Module
 from torch.optim import Adam, Optimizer
 
 LAYERS = 4
-HIDDEN = 128
+HIDDEN = 1024
 
 BATCH = 64
 TOLERANCE = 5

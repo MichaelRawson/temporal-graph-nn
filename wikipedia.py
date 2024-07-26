@@ -16,9 +16,9 @@ if __name__ == '__main__':
     evaluator = Evaluator(name="tgbl-wiki")
     total_nodes = max(int(dataset.src.max()), int(dataset.dst.max().item())) + 1
     total_events = len(dataset.ts)
-    num_train = dataset.train_mask.sum().item()
-    num_val = dataset.val_mask.sum().item()
-    num_test = dataset.test_mask.sum().item()
+    num_train = int(dataset.train_mask.sum())
+    num_val = int(dataset.val_mask.sum())
+    num_test = int(dataset.test_mask.sum())
     min_dst = int(dataset.dst.min())
     max_dst = int(dataset.dst.max())
 
@@ -51,7 +51,7 @@ if __name__ == '__main__':
         with torch.no_grad():
             hs = model.embed(src, dst, ts, event)
             y = model.predict_link(hs[-1], all_src, all_dst)
-        model.save(hs, root, pos_dst, event)
+        model.remember(hs, root, pos_dst, event)
         return evaluator.eval({
             'y_pred_pos': y[0],
             'y_pred_neg': y[1:].squeeze(),
@@ -83,12 +83,12 @@ if __name__ == '__main__':
                 optimiser.step()
                 optimiser.zero_grad()
 
-            model.save(hs, root, pos_dst, event)
+            model.remember(hs, root, pos_dst, event)
 
         # validate
         model.eval()
         validation_metric = 0
-        for event in range(110232, 110232 + num_val):
+        for event in range(num_train, num_train + num_val):
             validation_metric += test(event, validation=True)
 
         validation_metric /= num_val
@@ -112,6 +112,12 @@ if __name__ == '__main__':
 
     model = torch.load('checkpoint.pt')
     model.eval()
+    # "rehydrate" model with events
+    for event in range(num_train + num_val):
+        with torch.no_grad():
+            hs = model.embed(src, dst, ts, event)
+            model.remember(hs, src[event], dst[event], event)
+
     test_metric = 0
     for event in range(num_train + num_val, num_train + num_val + num_test):
         test_metric += test(event)
