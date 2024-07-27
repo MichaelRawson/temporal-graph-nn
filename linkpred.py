@@ -1,11 +1,26 @@
+from typing import Generator
+
 import torch
+from torch import Tensor
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from tgb.linkproppred.dataset_pyg import PyGLinkPropPredDataset
 from tgb.linkproppred.evaluate import Evaluator
 
 from models import Model
-from hyper import BATCH, DEVICE, TOLERANCE, make_optimiser
+from hyper import BATCH, DEVICE, PATIENCE, make_optimiser
+
+def batches(start: int, end: int) -> Generator[tuple[int, int], None, None]:
+    """iterator of [begin, end) batches"""
+
+    old = None
+    current = start
+    while current < end:
+        old = current
+        current += BATCH
+        if current > end:
+            current = end
+        yield old, current
 
 if __name__ == '__main__':
     import sys
@@ -35,79 +50,65 @@ if __name__ == '__main__':
     total_examples = 0
     epoch = 0
 
-    best_validation = float('-inf')
-    tolerance = TOLERANCE
+    best_validation = float('+inf')
+    patience = PATIENCE
 
-    def test(event, validation: bool = False) -> float :
-        root = src[event]
-        pos_dst = dst[event]
-        all_dst = torch.tensor(
-            [dst[event]] +
-            dataset.negative_sampler.query_batch(
-                src[event:event + 1],
-                dst[event:event + 1],
-                ts[event:event + 1],
-                split_mode='val' if validation else 'test'
-            )[0]
+    zeros = torch.zeros(BATCH, device=DEVICE)
+    ones = torch.ones(BATCH, device=DEVICE)
+    def forward(current: int, after: int) -> Tensor:
+        """do the forward pass and have `model` remember embeddings"""
+
+        batch = after - current
+        hs = model.embed(src, dst, ts, current)
+        root = src[current:after]
+        pos_dst = dst[current:after]
+        neg_dst = torch.randint(min_dst, max_dst + 1, (batch,), device=DEVICE)
+        loss = F.binary_cross_entropy_with_logits(
+            model.predict_link(
+                hs[-1],
+                torch.cat((root, root)),
+                torch.cat((neg_dst, pos_dst))
+            ),
+            torch.cat((zeros[:batch], ones[:batch]))
         )
-        all_src = root.repeat(all_dst.shape)
-        with torch.no_grad():
-            hs = model.embed(src, dst, ts, event)
-            y = model.predict_link(hs[-1], all_src, all_dst)
-        model.remember(hs, root, pos_dst, event)
-        return evaluator.eval({
-            'y_pred_pos': y[0],
-            'y_pred_neg': y[1:].squeeze(),
-            'eval_metric': [dataset.eval_metric]
-        })[dataset.eval_metric]
+        model.remember(hs, root, pos_dst, current)
+        return loss
 
 
     while True:
         print(f"epoch: {epoch}")
+
         # train
         model.train()
-        for event in range(num_train):
-            hs = model.embed(src, dst, ts, event)
-            root = src[event]
-            pos_dst = dst[event]
-            neg_dst = torch.randint(min_dst, max_dst + 1, ())
-            loss = F.binary_cross_entropy_with_logits(
-                model.predict_link(
-                    hs[-1],
-                    torch.tensor([root, root]),
-                    torch.tensor([neg_dst, pos_dst])
-                ),
-                torch.tensor([[0.], [1.]], device=DEVICE)
-            )
+        for current, after in batches(0, num_train):
+            loss = forward(current, after)
             loss.backward()
             writer.add_scalar('loss', loss.detach(), total_examples)
-            total_examples += 1
-            if total_examples % BATCH == 0:
-                optimiser.step()
-                optimiser.zero_grad()
-
-            model.remember(hs, root, pos_dst, event)
+            optimiser.step()
+            optimiser.zero_grad()
+            total_examples += after - current
 
         # validate
         model.eval()
-        validation_metric = 0
-        for event in range(num_train, num_train + num_val):
-            validation_metric += test(event, validation=True)
+        validation_loss = 0
+        for current, after in batches(num_train, num_train + num_val):
+            with torch.no_grad():
+                validation_loss += forward(current, after).detach()
 
-        validation_metric /= num_val
-        print(f"validation: {validation_metric:.5f}")
-        writer.add_scalar('validation', validation_metric, epoch)
+        validation_loss /= (1 + num_val / BATCH)
+        print(f"validation: {validation_loss:.5f}")
+        writer.add_scalar('validation', validation_loss, epoch)
 
-        if validation_metric >= best_validation:
-            best_validation = validation_metric
-            tolerance = TOLERANCE
+        if validation_loss < best_validation:
+            best_validation = validation_loss
+            patience = PATIENCE
             print("best so far, saving to checkpoint.pt")
             torch.save(model, 'checkpoint.pt')
         else:
-            print(f"not better, tolerance = {tolerance}")
-            tolerance -= 1
+            print(f"not better, patience = {patience}")
+            patience -= 1
 
-        if tolerance < 0:
+        if patience < 0:
             print("failed to improve, exit training")
             break
 
@@ -116,13 +117,37 @@ if __name__ == '__main__':
     model = torch.load('checkpoint.pt')
     model.eval()
     # "rehydrate" model with events
-    for event in range(num_train + num_val):
+    for current, after in batches(0, num_train + num_val):
         with torch.no_grad():
-            hs = model.embed(src, dst, ts, event)
-            model.remember(hs, src[event], dst[event], event)
+            hs = model.embed(src, dst, ts, current)
+            model.remember(hs, src[current:after], dst[current:after], current)
 
     test_metric = 0
-    for event in range(num_train + num_val, num_train + num_val + num_test):
-        test_metric += test(event)
+    for current, after in batches(num_train + num_val, num_train + num_val + num_test):
+        root = src[current:after]
+        pos_dst = dst[current:after]
+        with torch.no_grad():
+            hs = model.embed(src, dst, ts, current)
+
+        for i, neg_batch in enumerate(dataset.negative_sampler.query_batch(
+            root,
+            pos_dst,
+            ts[current:after],
+            split_mode='test'
+        )):
+            all_dst = torch.tensor(
+                [pos_dst[i]] +
+                neg_batch
+            )
+            all_src = root[i].repeat(all_dst.shape)
+            with torch.no_grad():
+                y = model.predict_link(hs[-1], all_src, all_dst)
+            test_metric += evaluator.eval({
+                'y_pred_pos': y[0],
+                'y_pred_neg': y[1:].squeeze(),
+                'eval_metric': [dataset.eval_metric]
+            })[dataset.eval_metric]
+        model.remember(hs, src[current:after], dst[current:after], current)
+
     test_metric /= num_test
     print(f"test: {test_metric:.5f}")

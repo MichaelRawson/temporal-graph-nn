@@ -20,7 +20,7 @@ class LinkPrediction(Module):
 
     def forward(self, h_u: Tensor, h_v: Tensor) -> Tensor:
         h = torch.cat((h_u, h_v), 1)
-        return self.output(torch.relu(self.hidden(h)))
+        return self.output(torch.relu(self.hidden(h))).squeeze()
 
 
 class T12(Module):
@@ -66,8 +66,8 @@ class T1(T12):
 
     def remember(self, h_u: Tensor, h_v: Tensor, event: int):
         """remember h_v(t) and h_u(t) for future reference"""
-        self.remember_u[event] = h_u
-        self.remember_v[event] = h_v
+        self.remember_u[event:event + h_u.shape[0]] = h_u
+        self.remember_v[event:event + h_v.shape[0]] = h_v
 
     def forward(self, u: Tensor, v: Tensor, g: Tensor, h: Tensor, event: int) -> Tensor:
         # move dimensions around a bit, should be cheap
