@@ -1,9 +1,9 @@
 import torch
 from torch import Tensor
-from torch.nn import BatchNorm1d, Module, ModuleList, Linear
+from torch.nn import BatchNorm1d, Module, ModuleList, Linear, Parameter
 from torch.nn.modules import BatchNorm1d
 
-from hyper import LAYERS, HIDDEN, DEVICE
+from hyper import EMBED, LAYERS, HIDDEN, DEVICE
 
 class LinkPrediction(Module):
     """link prediction head"""
@@ -135,12 +135,14 @@ class Model(Module):
         self.total_nodes = total_nodes
         Layer = {'T1': T1, 'T2': T2}[flavour]
         layers = []
-        embed_size = 0
+        embed_size = EMBED
         for _ in range(LAYERS):
             layers.append(Layer(total_nodes, total_events, embed_size))
             embed_size = 2 * embed_size + 1
+
         self.layers = ModuleList(layers)
         self.link = LinkPrediction(embed_size)
+        self.register_buffer('h0', torch.rand(total_nodes, EMBED), persistent=True)
 
     def embed(self, u: Tensor, v: Tensor, t: Tensor, event: int) -> list[Tensor]:
         """compute the embedding for each node at the present time"""
@@ -157,8 +159,8 @@ class Model(Module):
             tlast = t[-1]
 
         g = ((tlast - t) / (1 + tlast - tfirst)).unsqueeze(1)
-        # no node-level embedding
-        h = torch.zeros(self.total_nodes, 0, device=DEVICE)
+        # no node-level embedding, use random colours
+        h = self.h0
 
         hs = [h]
         for layer in self.layers:
