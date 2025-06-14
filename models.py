@@ -23,6 +23,23 @@ class LinkPrediction(Module):
         return self.output(torch.relu(self.hidden(h))).squeeze()
 
 
+class NodePrediction(Module):
+    """node prediction head"""
+
+    hidden: Linear
+    """hidden layer"""
+    output: Linear
+    """output layer"""
+
+    def __init__(self, embedding_size: int, out_size: int):
+        super().__init__()
+        self.hidden = Linear(embedding_size, HIDDEN)
+        self.output = Linear(HIDDEN, out_size)
+
+    def forward(self, h: Tensor) -> Tensor:
+        return self.output(torch.relu(self.hidden(h))).squeeze()
+
+
 class T12(Module):
     """base class for T1 and T2"""
 
@@ -128,9 +145,11 @@ class Model(Module):
     layers: ModuleList
     """the embedding layers for this model"""
     link: LinkPrediction
-    """output layer"""
+    """output layer - links"""
+    node: NodePrediction
+    """output layer - nodes"""
 
-    def __init__(self, flavour: str, total_nodes: int, total_events: int):
+    def __init__(self, flavour: str, total_nodes: int, total_events: int, classes = 0):
         super().__init__()
         self.total_nodes = total_nodes
         Layer = {'T1': T1, 'T2': T2}[flavour]
@@ -142,6 +161,7 @@ class Model(Module):
 
         self.layers = ModuleList(layers)
         self.link = LinkPrediction(embed_size)
+        self.node = NodePrediction(embed_size, classes)
         self.register_buffer('h0', torch.rand(total_nodes, EMBED), persistent=True)
 
     def embed(self, u: Tensor, v: Tensor, t: Tensor, event: int) -> list[Tensor]:
@@ -182,3 +202,6 @@ class Model(Module):
         """given an embedding, predict whether {u, v} at the next time point"""
 
         return self.link(h[u], h[v])
+
+    def predict_node(self, h: Tensor) -> Tensor:
+        return self.node(h)
